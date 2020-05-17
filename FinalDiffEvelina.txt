@@ -1,0 +1,166 @@
+diff --git a/chrome/browser/ui/tabs/pinned_tab_service.cc b/chrome/browser/ui/tabs/pinned_tab_service.cc
+index c3d7629877ae..2c1b916074bc 100644
+--- a/chrome/browser/ui/tabs/pinned_tab_service.cc
++++ b/chrome/browser/ui/tabs/pinned_tab_service.cc
+@@ -4,12 +4,25 @@
+ 
+ #include "chrome/browser/ui/tabs/pinned_tab_service.h"
+ 
++#include "base/feature_list.h"
+ #include "chrome/browser/chrome_notification_types.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/browser.h"
+ #include "chrome/browser/ui/browser_list.h"
+ #include "chrome/browser/ui/tabs/pinned_tab_codec.h"
++#include "content/public/browser/navigation_entry.h"
+ #include "content/public/browser/notification_service.h"
++#include "third_party/blink/public/common/features.h"
++
++using content::NavigationEntry;
++
++void AddTabToStartupRestore(content::WebContents* web_contents,
++                            StartupTabs& tabs_to_restore) {
++  NavigationEntry* entry =
++      web_contents->GetController().GetLastCommittedEntry();
++  if (entry)
++    tabs_to_restore.emplace_back(entry->GetURL(), true);
++}
+ 
+ PinnedTabService::PinnedTabService(Profile* profile) : profile_(profile) {
+   registrar_.Add(this, chrome::NOTIFICATION_CLOSE_ALL_BROWSERS_REQUEST,
+@@ -44,8 +57,13 @@ void PinnedTabService::Observe(int type,
+   //     over-writing the correct state.
+   // Saving is re-enabled if a new tab or window is opened.
+   DCHECK_EQ(type, chrome::NOTIFICATION_CLOSE_ALL_BROWSERS_REQUEST);
+-  if (TabStripModelObserver::IsObservingAny(this))
++  if (TabStripModelObserver::IsObservingAny(this)) {
++    if (base::FeatureList::IsEnabled(
++            blink::features::kRestorePinnedTabsInNextStartup)) {
++      RememberPinnedTabs();
++    }
+     WritePinnedTabsIfNecessary();
++  }
+ }
+ 
+ void PinnedTabService::OnBrowserAdded(Browser* browser) {
+@@ -60,6 +78,11 @@ void PinnedTabService::OnBrowserClosing(Browser* browser) {
+   if (browser->profile() != profile_ || !browser->is_type_normal())
+     return;
+ 
++  if (base::FeatureList::IsEnabled(
++          blink::features::kRestorePinnedTabsInNextStartup)) {
++    RememberPinnedTabs(browser);
++  }
++
+   if (TabStripModelObserver::CountObservedModels(this) == 1)
+     WritePinnedTabsIfNecessary();
+ }
+@@ -88,7 +111,33 @@ void PinnedTabService::OnTabStripModelChanged(
+ }
+ 
+ void PinnedTabService::WritePinnedTabsIfNecessary() {
+-  if (need_to_write_pinned_tabs_)
+-    PinnedTabCodec::WritePinnedTabs(profile_);
++  if (need_to_write_pinned_tabs_) {
++    if (base::FeatureList::IsEnabled(
++            blink::features::kRestorePinnedTabsInNextStartup)) {
++      PinnedTabCodec::WritePinnedTabs(profile_,
++                                      closed_pinned_tabs_to_startup_restore_);
++    } else {
++      PinnedTabCodec::WritePinnedTabs(profile_);
++    }
++  }
+   need_to_write_pinned_tabs_ = false;
+ }
++
++void PinnedTabService::RememberPinnedTabs(const Browser* browser) {
++  if (browser->profile() != profile_ || !browser->is_type_normal())
++    return;
++
++  TabStripModel* tab_model = browser->tab_strip_model();
++
++  for (int i = 0; i < tab_model->count() && tab_model->IsTabPinned(i); ++i) {
++    StartupTab tab;
++    content::WebContents* web_contents = tab_model->GetWebContentsAt(i);
++    AddTabToStartupRestore(web_contents,
++                           closed_pinned_tabs_to_startup_restore_);
++  }
++}
++
++void PinnedTabService::RememberPinnedTabs() {
++  for (auto* browser : *BrowserList::GetInstance())
++    RememberPinnedTabs(browser);
++}
+diff --git a/chrome/browser/ui/tabs/pinned_tab_service.h b/chrome/browser/ui/tabs/pinned_tab_service.h
+index f8f047fb9e0d..13a10fcdbdf1 100644
+--- a/chrome/browser/ui/tabs/pinned_tab_service.h
++++ b/chrome/browser/ui/tabs/pinned_tab_service.h
+@@ -8,7 +8,9 @@
+ #include "base/compiler_specific.h"
+ #include "base/macros.h"
+ #include "base/scoped_observer.h"
++#include "chrome/browser/ui/browser_list.h"
+ #include "chrome/browser/ui/browser_list_observer.h"
++#include "chrome/browser/ui/startup/startup_tab.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+ #include "components/keyed_service/core/keyed_service.h"
+@@ -45,6 +47,11 @@ class PinnedTabService : public content::NotificationObserver,
+       const TabStripModelChange& change,
+       const TabStripSelectionChange& selection) override;
+ 
++  // Writes the pinned tabs from the closing browser(s) window(s) to
++  // |closed_pinned_tabs_to_startup_restore_|.
++  void RememberPinnedTabs(const Browser* browser);
++  void RememberPinnedTabs();
++
+   // Writes the pinned tabs for |profile_|, but only if a new tab or browser
+   // window has been added since the last time the method was called.
+   void WritePinnedTabsIfNecessary();
+@@ -58,6 +65,9 @@ class PinnedTabService : public content::NotificationObserver,
+ 
+   content::NotificationRegistrar registrar_;
+ 
++  // Closed pinned tabs that will be restored in the next session.
++  StartupTabs closed_pinned_tabs_to_startup_restore_;
++
+   DISALLOW_COPY_AND_ASSIGN(PinnedTabService);
+ };
+ 
+diff --git a/third_party/blink/common/features.cc b/third_party/blink/common/features.cc
+index afc23a8cd972..62e6114b8492 100644
+--- a/third_party/blink/common/features.cc
++++ b/third_party/blink/common/features.cc
+@@ -275,7 +275,7 @@ const base::Feature kAudioWorkletRealtimeThread{
+     "AudioWorkletRealtimeThread", base::FEATURE_DISABLED_BY_DEFAULT};
+ 
+ // A feature to reduce the set of resources fetched by No-State Prefetch.
+-const base::Feature kLightweightNoStatePrefetch{
++const base::Feature kLightweightNoStatePrefetch {
+   "LightweightNoStatePrefetch",
+ #if defined(OS_ANDROID)
+       base::FEATURE_ENABLED_BY_DEFAULT
+@@ -478,5 +478,10 @@ const base::Feature kSuppressContentTypeForBeaconMadeWithArrayBufferView{
+     "SuppressContentTypeForBeaconMadeWithArrayBufferView",
+     base::FEATURE_ENABLED_BY_DEFAULT};
+ 
++// If the user has not chosen to restore the last session on startup, the
++// pinned tabs from all closing windows are restored on next start the browser.
++const base::Feature kRestorePinnedTabsInNextStartup{
++    "RestorePinnedTabsInNextStartup", base::FEATURE_ENABLED_BY_DEFAULT};
++
+ }  // namespace features
+ }  // namespace blink
+diff --git a/third_party/blink/public/common/features.h b/third_party/blink/public/common/features.h
+index 1cd7f39ced81..0b2cfc57818e 100644
+--- a/third_party/blink/public/common/features.h
++++ b/third_party/blink/public/common/features.h
+@@ -157,6 +157,8 @@ BLINK_COMMON_EXPORT extern const base::Feature kDiscardCodeCacheAfterFirstUse;
+ BLINK_COMMON_EXPORT extern const base::Feature
+     kSuppressContentTypeForBeaconMadeWithArrayBufferView;
+ 
++BLINK_COMMON_EXPORT extern const base::Feature kRestorePinnedTabsInNextStartup;
++
+ }  // namespace features
+ }  // namespace blink
+ 
