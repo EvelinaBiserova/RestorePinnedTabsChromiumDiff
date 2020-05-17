@@ -1,0 +1,517 @@
+diff --git a/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc b/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
+index d03c63dcf7f4..e99d34954cea 100644
+--- a/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
++++ b/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
+@@ -79,6 +79,7 @@
+ #include "chrome/browser/ui/app_list/app_list_syncable_service_factory.h"
+ #include "chrome/browser/ui/find_bar/find_bar_state_factory.h"
+ #include "chrome/browser/ui/prefs/prefs_tab_helper.h"
++#include "chrome/browser/ui/tabs/max_pinned_tab_factory.h"
+ #include "chrome/browser/ui/tabs/pinned_tab_service_factory.h"
+ #include "chrome/browser/ui/webui/ntp/ntp_resource_cache_factory.h"
+ #include "chrome/browser/ui/webui/signin/login_ui_service_factory.h"
+@@ -302,6 +303,7 @@ void ChromeBrowserMainExtraPartsProfiles::
+ #endif
+   PasswordStoreFactory::GetInstance();
+ #if !defined(OS_ANDROID)
++  MaxPinnedTabFactory::GetInstance();
+   PinnedTabServiceFactory::GetInstance();
+   ThemeServiceFactory::GetInstance();
+ #endif
+diff --git a/chrome/browser/ui/BUILD.gn b/chrome/browser/ui/BUILD.gn
+index 80adc5a000de..449ab5e7faf6 100644
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -1169,6 +1169,10 @@ jumbo_static_library("ui") {
+       "tabs/pinned_tab_service.h",
+       "tabs/pinned_tab_service_factory.cc",
+       "tabs/pinned_tab_service_factory.h",
++      "tabs/max_pinned_tab.cc",
++      "tabs/max_pinned_tab.h",
++      "tabs/max_pinned_tab_factory.cc",
++      "tabs/max_pinned_tab_factory.h",
+       "tabs/tab_change_type.h",
+       "tabs/tab_group.cc",
+       "tabs/tab_group.h",
+diff --git a/chrome/browser/ui/tabs/max_pinned_tab.cc b/chrome/browser/ui/tabs/max_pinned_tab.cc
+new file mode 100644
+index 000000000000..9f4698515a74
+--- /dev/null
++++ b/chrome/browser/ui/tabs/max_pinned_tab.cc
+@@ -0,0 +1,86 @@
++#include "chrome/browser/ui/tabs/max_pinned_tab.h"
++#include "chrome/browser/chrome_notification_types.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser.h"
++#include "chrome/browser/ui/browser_commands.h"
++#include "chrome/browser/ui/browser_list.h"
++#include "chrome/browser/ui/browser_window.h"
++#include "chrome/browser/ui/tabs/pinned_tab_codec.h"
++#include "chrome/browser/ui/tabs/pinned_tab_service.h"
++#include "content/public/browser/notification_service.h"
++
++MaxPinnedTab::MaxPinnedTab(Profile* profile) : profile_(profile) {
++  registrar_.Add(this, chrome::NOTIFICATION_CLOSE_ALL_BROWSERS_REQUEST,
++                 content::NotificationService::AllSources());
++
++  for (Browser* browser : *BrowserList::GetInstance())
++    OnBrowserAdded(browser);
++
++  BrowserList::AddObserver(this);
++}
++MaxPinnedTab::~MaxPinnedTab() {
++  BrowserList::RemoveObserver(this);
++}
++void MaxPinnedTab::Observe(int type,
++                           const content::NotificationSource& source,
++                           const content::NotificationDetails& details) {
++  return;
++}
++void MaxPinnedTab::OnBrowserClosing(Browser* browser) {
++  if (browser->profile() != profile_ || !browser->is_type_normal())
++    return;
++  if (browser->tab_strip_model()->IndexOfFirstNonPinnedTab()) {
++    std::vector<int> temp;
++    temp.resize(browser->tab_strip_model()->IndexOfFirstNonPinnedTab());
++    for (std::size_t i = 0; i < temp.size(); ++i) {
++      temp[i] = i;
++    }
++    auto itend = BrowserList::GetInstance()->end_last_active();
++    for (auto it = BrowserList::GetInstance()->begin_last_active(); it != itend;
++         ++it) {
++      if (browser != *it) {
++        sameMoveToExistingWindow(browser, *it, temp);
++        break;
++      }
++    }
++    return;
++  }
++}
++
++void MaxPinnedTab::sameMoveToExistingWindow(
++    Browser* source,
++    Browser* target,
++    const std::vector<int>& tab_indices) {
++  if (tab_indices.empty())
++    return;
++
++  int indices_size = tab_indices.size();
++  auto size_pin = target->tab_strip_model()->IndexOfFirstNonPinnedTab();
++  for (int i = 0; i < indices_size; i++) {
++    int adjusted_index = tab_indices[i] - i;
++    auto contents_move =
++        source->tab_strip_model()->DetachWebContentsAt(adjusted_index);
++
++    auto url_move = contents_move->GetLastCommittedURL();
++
++    if (size_pin) {
++      bool duples = false;
++      for (int j = 0; j < size_pin; ++j) {
++        if (url_move == target->tab_strip_model()
++                            ->GetWebContentsAt(j)
++                            ->GetLastCommittedURL()) {
++          duples = true;
++          break;
++        }
++      }
++      if (duples) {
++        continue;
++      }
++    }
++
++    target->tab_strip_model()->AddWebContents(std::move(contents_move), -1,
++                                              ui::PAGE_TRANSITION_LINK,
++                                              TabStripModel::ADD_PINNED);
++  }
++  target->window()->Show();
++}
+diff --git a/chrome/browser/ui/tabs/max_pinned_tab.h b/chrome/browser/ui/tabs/max_pinned_tab.h
+new file mode 100644
+index 000000000000..0f05fc112269
+--- /dev/null
++++ b/chrome/browser/ui/tabs/max_pinned_tab.h
+@@ -0,0 +1,38 @@
++#ifndef CHROME_BROWSER_UI_TABS_PINNED_MAX_H_
++#define CHROME_BROWSER_UI_TABS_PINNED_MAX_H_
++
++#include "base/compiler_specific.h"
++#include "base/macros.h"
++#include "base/scoped_observer.h"
++#include "chrome/browser/ui/browser_list_observer.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
++#include "components/keyed_service/core/keyed_service.h"
++#include "content/public/browser/notification_observer.h"
++#include "content/public/browser/notification_registrar.h"
++
++class Profile;
++class MaxPinnedTab : public content::NotificationObserver,
++                     public BrowserListObserver,
++                     public TabStripModelObserver,
++                     public KeyedService {
++ public:
++  explicit MaxPinnedTab(Profile* profile);
++  ~MaxPinnedTab() override;
++
++ private:
++  void Observe(int type,
++               const content::NotificationSource& source,
++               const content::NotificationDetails& details) override;
++  void OnBrowserClosing(Browser* browser) override;
++  void sameMoveToExistingWindow(Browser* source,
++                                Browser* target,
++                                const std::vector<int>& tab_indices);
++  Profile* profile_;
++
++  content::NotificationRegistrar registrar_;
++
++  DISALLOW_COPY_AND_ASSIGN(MaxPinnedTab);
++};
++
++#endif  // CHROME_BROWSER_UI_TABS_PINNED_MAX_H_
+diff --git a/chrome/browser/ui/tabs/max_pinned_tab_browsertest.cc b/chrome/browser/ui/tabs/max_pinned_tab_browsertest.cc
+new file mode 100644
+index 000000000000..c3cbd9877411
+--- /dev/null
++++ b/chrome/browser/ui/tabs/max_pinned_tab_browsertest.cc
+@@ -0,0 +1,131 @@
++// Copyright 2018 The Chromium Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/tabs/max_pinned_tab.h"
++
++#include "chrome/browser/chrome_notification_types.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser.h"
++#include "chrome/browser/ui/browser_list.h"
++#include "chrome/browser/ui/browser_navigator_params.h"
++#include "chrome/browser/ui/browser_window.h"
++#include "chrome/browser/ui/tabs/max_pinned_tab_factory.h"
++#include "chrome/browser/ui/tabs/pinned_tab_codec.h"
++#include "chrome/browser/ui/tabs/pinned_tab_test_utils.h"
++#include "chrome/test/base/in_process_browser_test.h"
++#include "chrome/test/base/ui_test_utils.h"
++#include "content/public/browser/notification_service.h"
++#include "content/public/test/test_utils.h"
++
++#include "chrome/app/chrome_command_ids.h"
++#include "chrome/browser/chrome_content_browser_client.h"
++#include "chrome/browser/command_updater.h"
++#include "chrome/browser/defaults.h"
++#include "chrome/browser/devtools/devtools_window_testing.h"
++#include "chrome/browser/extensions/extension_browsertest.h"
++#include "chrome/browser/extensions/extension_service.h"
++#include "chrome/browser/extensions/tab_helper.h"
++#include "chrome/browser/first_run/first_run.h"
++#include "chrome/browser/lifetime/application_lifetime.h"
++#include "chrome/browser/prefs/incognito_mode_prefs.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/profiles/profile_attributes_storage.h"
++#include "chrome/browser/profiles/profile_manager.h"
++#include "chrome/browser/search/search.h"
++#include "chrome/browser/sessions/session_service_factory.h"
++#include "chrome/browser/translate/chrome_translate_client.h"
++#include "chrome/browser/ui/browser_command_controller.h"
++#include "chrome/browser/ui/browser_commands.h"
++#include "chrome/browser/ui/browser_finder.h"
++#include "chrome/browser/ui/browser_list.h"
++#include "chrome/browser/ui/browser_tabstrip.h"
++#include "chrome/browser/ui/browser_ui_prefs.h"
++#include "chrome/browser/ui/browser_window.h"
++#include "chrome/browser/ui/exclusive_access/exclusive_access_context.h"
++#include "chrome/browser/ui/exclusive_access/exclusive_access_manager.h"
++#include "chrome/browser/ui/search/local_ntp_test_utils.h"
++#include "chrome/browser/ui/search/search_tab_helper.h"
++#include "chrome/browser/ui/startup/startup_browser_creator.h"
++#include "chrome/browser/ui/startup/startup_browser_creator_impl.h"
++#include "chrome/browser/ui/tabs/pinned_tab_codec.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/ui_features.h"
++#include "chrome/common/buildflags.h"
++#include "chrome/common/chrome_paths.h"
++#include "chrome/common/chrome_switches.h"
++#include "chrome/common/extensions/manifest_handlers/app_launch_info.h"
++#include "chrome/common/pref_names.h"
++#include "chrome/common/url_constants.h"
++#include "chrome/grit/chromium_strings.h"
++#include "chrome/grit/generated_resources.h"
++#include "chrome/test/base/in_process_browser_test.h"
++#include "chrome/test/base/ui_test_utils.h"
++
++namespace {
++
++// Wait until a browser is removed from BrowserList.
++class BrowserRemovalWaiter : public BrowserListObserver {
++ public:
++  explicit BrowserRemovalWaiter(const Browser* browser) : browser_(browser) {
++    BrowserList::AddObserver(this);
++  }
++  ~BrowserRemovalWaiter() override = default;
++
++  void WaitForRemoval() {
++    message_loop_runner_ = new content::MessageLoopRunner;
++    message_loop_runner_->Run();
++  }
++
++ private:
++  // BrowserListObserver override:
++  void OnBrowserRemoved(Browser* browser) override {
++    if (browser != browser_)
++      return;
++
++    BrowserList::RemoveObserver(this);
++    if (message_loop_runner_.get() && message_loop_runner_->loop_running())
++      message_loop_runner_->Quit();
++  }
++
++  const Browser* const browser_;
++  scoped_refptr<content::MessageLoopRunner> message_loop_runner_;
++
++  DISALLOW_COPY_AND_ASSIGN(BrowserRemovalWaiter);
++};
++
++using MaxPinnedTabBrowserTest = InProcessBrowserTest;
++
++}  // namespace
++
++// Makes sure pinned tabs are updated when tabstrip is empty.
++// http://crbug.com/71939
++IN_PROC_BROWSER_TEST_F(MaxPinnedTabBrowserTest, TabStripEmpty) {
++  Profile* profile = browser()->profile();
++  GURL url("http://www.google.com");
++  chrome::NewEmptyWindow(browser()->profile());
++  Browser* second_window = BrowserList::GetInstance()->GetLastActive();
++  std::unique_ptr<content::WebContents> web_contents(
++      content::WebContents::Create(
++          content::WebContents::CreateParams(profile)));
++  second_window->tab_strip_model()->AddWebContents(
++      std::move(web_contents), 0, ui::PageTransition::PAGE_TRANSITION_FIRST,
++      1 << 1);
++  second_window->OnWindowClosing();
++  int result = browser()->tab_strip_model()->IndexOfFirstNonPinnedTab();
++  BrowserRemovalWaiter waiter(browser());
++  BrowserRemovalWaiter waiter1(std::move(second_window));
++  waiter1.WaitForRemoval();
++  EXPECT_EQ(1, result);
++  browser()->OnWindowClosing();
++  waiter.WaitForRemoval();
++#if defined(OS_CHROMEOS)
++  chrome::AttemptExit();
++#else
++  chrome::ExecuteCommand(second_window, IDC_EXIT);
++#endif
++}
++
++IN_PROC_BROWSER_TEST_F(MaxPinnedTabBrowserTest, trues) {
++  EXPECT_EQ(true, true);
++}
+diff --git a/chrome/browser/ui/tabs/max_pinned_tab_factory.cc b/chrome/browser/ui/tabs/max_pinned_tab_factory.cc
+new file mode 100644
+index 000000000000..8aa2cef9f4a3
+--- /dev/null
++++ b/chrome/browser/ui/tabs/max_pinned_tab_factory.cc
+@@ -0,0 +1,34 @@
++#include "chrome/browser/ui/tabs/max_pinned_tab_factory.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/tabs/max_pinned_tab.h"
++#include "components/keyed_service/content/browser_context_dependency_manager.h"
++
++// static
++MaxPinnedTab* MaxPinnedTabFactory::GetForProfile(Profile* profile) {
++  return static_cast<MaxPinnedTab*>(
++      GetInstance()->GetServiceForBrowserContext(profile, true));
++}
++
++MaxPinnedTabFactory* MaxPinnedTabFactory::GetInstance() {
++  return base::Singleton<MaxPinnedTabFactory>::get();
++}
++
++MaxPinnedTabFactory::MaxPinnedTabFactory()
++    : BrowserContextKeyedServiceFactory(
++          "MaxPinnedTab",
++          BrowserContextDependencyManager::GetInstance()) {}
++
++MaxPinnedTabFactory::~MaxPinnedTabFactory() {}
++
++KeyedService* MaxPinnedTabFactory::BuildServiceInstanceFor(
++    content::BrowserContext* profile) const {
++  return new MaxPinnedTab(static_cast<Profile*>(profile));
++}
++
++bool MaxPinnedTabFactory::ServiceIsCreatedWithBrowserContext() const {
++  return true;
++}
++
++bool MaxPinnedTabFactory::ServiceIsNULLWhileTesting() const {
++  return true;
++}
+diff --git a/chrome/browser/ui/tabs/max_pinned_tab_factory.h b/chrome/browser/ui/tabs/max_pinned_tab_factory.h
+new file mode 100644
+index 000000000000..6e5e419c40a9
+--- /dev/null
++++ b/chrome/browser/ui/tabs/max_pinned_tab_factory.h
+@@ -0,0 +1,34 @@
++#ifndef CHROME_BROWSER_UI_TABS_PINNED_MAX_FACTORY_H_
++#define CHROME_BROWSER_UI_TABS_PINNED_MAX_FACTORY_H_
++
++#include "base/compiler_specific.h"
++#include "base/memory/singleton.h"
++#include "components/keyed_service/content/browser_context_keyed_service_factory.h"
++
++class MaxPinnedTab;
++class Profile;
++
++// Singleton that owns all MaxPinnedTab and associates them with Profiles.
++// Listens for the Profile's destruction notification and cleans up the
++// associated MaxPinnedTab.
++class MaxPinnedTabFactory : public BrowserContextKeyedServiceFactory {
++ public:
++  // Returns the MaxPinnedTab that tracks pinning changes for |profile|.
++  static MaxPinnedTab* GetForProfile(Profile* profile);
++
++  static MaxPinnedTabFactory* GetInstance();
++
++ private:
++  friend struct base::DefaultSingletonTraits<MaxPinnedTabFactory>;
++
++  MaxPinnedTabFactory();
++  ~MaxPinnedTabFactory() override;
++
++  // BrowserContextKeyedServiceFactory:
++  KeyedService* BuildServiceInstanceFor(
++      content::BrowserContext* profile) const override;
++  bool ServiceIsCreatedWithBrowserContext() const override;
++  bool ServiceIsNULLWhileTesting() const override;
++};
++
++#endif  // CHROME_BROWSER_UI_TABS_PINNED_MAX_FACTORY_H_
+diff --git a/chrome/browser/ui/tabs/max_pinned_tab_unittest.cc b/chrome/browser/ui/tabs/max_pinned_tab_unittest.cc
+new file mode 100644
+index 000000000000..3bb506f8dd3e
+--- /dev/null
++++ b/chrome/browser/ui/tabs/max_pinned_tab_unittest.cc
+@@ -0,0 +1,65 @@
++#include "chrome/browser/ui/tabs/max_pinned_tab.h"
++
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "base/bind.h"
++#include "base/macros.h"
++#include "chrome/browser/ui/browser.h"
++#include "chrome/browser/ui/browser_tabstrip.h"
++#include "chrome/browser/ui/tabs/max_pinned_tab_factory.h"
++#include "chrome/browser/ui/tabs/pinned_tab_codec.h"
++#include "chrome/browser/ui/tabs/pinned_tab_test_utils.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/test/base/browser_with_test_window_test.h"
++#include "chrome/test/base/testing_profile.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace {
++
++std::unique_ptr<KeyedService> BuildPinnedTabService(
++    content::BrowserContext* profile) {
++  return std::make_unique<MaxPinnedTab>(static_cast<Profile*>(profile));
++}
++MaxPinnedTab* BuildForProfile(Profile* profile) {
++  return static_cast<MaxPinnedTab*>(
++      MaxPinnedTabFactory::GetInstance()->SetTestingFactoryAndUse(
++          profile, base::BindRepeating(&BuildPinnedTabService)));
++}
++class MaxPinnedTabTest : public BrowserWithTestWindowTest {
++ public:
++  MaxPinnedTabTest() : max_pinned_tab_(NULL) {}
++
++ protected:
++  TestingProfile* CreateProfile() override {
++    TestingProfile* profile = BrowserWithTestWindowTest::CreateProfile();
++    max_pinned_tab_ = BuildForProfile(profile);
++    return profile;
++  }
++
++ private:
++  MaxPinnedTab* max_pinned_tab_;
++
++  DISALLOW_COPY_AND_ASSIGN(MaxPinnedTabTest);
++};
++TEST_F(MaxPinnedTabTest, Popup) {
++  GURL url1("http://www.google.com");
++  GURL url2("http://www.ya.ru");
++  GURL url3("http://www.mail.ru");
++  Browser::CreateParams params(Browser::TYPE_POPUP, profile(), true);
++  std::unique_ptr<Browser> second_b(
++      CreateBrowserWithTestWindowForParams(&params));
++  std::unique_ptr<Browser> third_b(
++      CreateBrowserWithTestWindowForParams(&params));
++  AddTab(second_b.get(), url1);
++  second_b->tab_strip_model()->SetTabPinned(0, true);
++  AddTab(third_b.get(), url3);
++  third_b->tab_strip_model()->SetTabPinned(0, true);
++  AddTab(browser(), url1);
++  second_b->OnWindowClosing();
++  third_b->OnWindowClosing();
++  EXPECT_EQ(browser()->tab_strip_model()->IndexOfFirstNonPinnedTab(), 2);
++}
++
++}  // namespace
+diff --git a/chrome/browser/ui/tabs/pinned_tab_service.cc b/chrome/browser/ui/tabs/pinned_tab_service.cc
+index c3d7629877ae..f8c784fd5b31 100644
+--- a/chrome/browser/ui/tabs/pinned_tab_service.cc
++++ b/chrome/browser/ui/tabs/pinned_tab_service.cc
+@@ -3,7 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "chrome/browser/ui/tabs/pinned_tab_service.h"
+-
++#include "chrome/browser/ui/browser_commands.h"
+ #include "chrome/browser/chrome_notification_types.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/browser.h"
+@@ -62,6 +62,24 @@ void PinnedTabService::OnBrowserClosing(Browser* browser) {
+ 
+   if (TabStripModelObserver::CountObservedModels(this) == 1)
+     WritePinnedTabsIfNecessary();
++
++  // if(TabStripModelObserver::CountObservedModels(this) > 1) {
++  //    std::vector<int> temp;
++  //     temp.resize(browser->tab_strip_model()->IndexOfFirstNonPinnedTab());
++  //    for(std::size_t i=0;i<temp.size();++i){
++  //      temp[i]=i;
++  //    }
++  //    for(auto* it : *BrowserList::GetInstance()){
++  //      if(browser != it){
++  //        chrome::MoveToExistingWindow(
++  //       browser, it,
++  //       temp);
++  //        break;
++  //      }
++  //    }
++
++  //    return;
++  //  }
+ }
+ 
+ void PinnedTabService::OnBrowserRemoved(Browser* browser) {
+diff --git a/chrome/test/BUILD.gn b/chrome/test/BUILD.gn
+index 2a22a0efbc18..cc91f5452796 100644
+--- a/chrome/test/BUILD.gn
++++ b/chrome/test/BUILD.gn
+@@ -1195,6 +1195,7 @@ if (!is_android) {
+       "../browser/ui/manifest_web_app_browsertest.cc",
+       "../browser/ui/passwords/google_password_manager_navigation_throttle_browsertest.cc",
+       "../browser/ui/tabs/pinned_tab_service_browsertest.cc",
++      "../browser/ui/tabs/max_pinned_tab_browsertest.cc",
+       "../browser/ui/thumbnails/thumbnail_tab_helper_browsertest.cc",
+       "../browser/ui/views/sharing/click_to_call_browsertest.cc",
+       "../browser/ui/views/sharing/remote_copy_browsertest.cc",
+@@ -4147,6 +4148,7 @@ test("unit_tests") {
+       "../browser/ui/tabs/existing_window_sub_menu_model_unittest.cc",
+       "../browser/ui/tabs/pinned_tab_codec_unittest.cc",
+       "../browser/ui/tabs/pinned_tab_service_unittest.cc",
++      "../browser/ui/tabs/max_pinned_tab_unittest.cc",
+       "../browser/ui/tabs/tab_menu_model_unittest.cc",
+       "../browser/ui/tabs/tab_strip_model_stats_recorder_unittest.cc",
+       "../browser/ui/tabs/tab_strip_model_unittest.cc",
